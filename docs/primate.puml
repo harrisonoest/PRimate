@@ -1,0 +1,30 @@
+@startuml PRimate Sequence
+
+actor "PRimate" as bot
+participant "User Model" as user_model
+participant "GitLab Model" as git
+participant "Slack Model" as slack
+participant "Summary Model" as summary
+
+group Start Up
+bot -> user_model: fetchUsers()
+bot <- user_model: slack_users: Object
+bot -> bot: saveUsers(users: Object)
+end
+
+group PR Posted
+' Watches for PRs in channels
+' Starts tracking a PR when one is posted
+' Responds in the thread when comments are added
+' Responds in the thread when approval is added
+' Responds in the thread when ready to merge
+' Maybe uses emojis for this?
+end
+
+group Daily Summary
+' Tracks the PRs that users are currently assigned to
+' DMs users once a day to notify them about outstanding PRs
+' Maybe add a way to allow a user to remove a PR from their summary?
+end
+
+@enduml

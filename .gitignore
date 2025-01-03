@@ -1,0 +1,20 @@
+# Environment variables
+.env
+
+# IDE specific files
+.idea/
+.vscode/
+
+# Logs
+logs/
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Node modules
+node_modules/*
+
+# Data files
+data/*

@@ -1,0 +1,13 @@
+services:
+  primate-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: primate:optimized
+    container_name: primate-bot
+    volumes:
+      - ./logs:/usr/src/app/logs
+      - ./data:/usr/src/app/data
+    env_file:
+      - .env
+    restart: unless-stopped
