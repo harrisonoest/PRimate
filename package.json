@@ -1,6 +1,6 @@
 {
   "name": "primate",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Manages GitLab pull requests for the UXTeam.",
   "main": "bot.js",
   "dependencies": {

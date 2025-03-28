@@ -42,14 +42,6 @@ Update the `.env` file to change:
 - Daily summary time
 - API keys
 
-## Deployment
-
-The bot is deployed on a VSphere server.This is the same server that hosts the UXTeam Vault.
-
-The deployment is done using the `build_deploy.sh` script. This script builds the Docker image and compresses it into a TGZ. The TGZ is then sent to the UXTeam-Vault server using `scp`.
-
-Simply run `./build_deploy.sh` to deploy the bot.
-
 ## Improvements
 - Slack messages for pipeline failures
 - Don't send notification if the user has left comments on the PR
