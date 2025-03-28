@@ -27,7 +27,7 @@ prTracker.delete = function (key) {
 
 /**
  * Get all PRs that need review, grouped by reviewer
- * @returns {Map<string, Array<{prUrl: string, messageTs: string}>>} Map of reviewer ID to array of their pending PRs
+ * @returns {Map<string, Array<{prUrl: string, messageTs: string, channel: string}>>} Map of reviewer ID to array of their pending PRs
  */
 function getPendingReviews() {
   const reviewerPRs = new Map();
@@ -43,8 +43,12 @@ function getPendingReviews() {
         reviewerPRs.get(reviewerId).push({
           prUrl: pr.prUrl,
           messageTs: messageTs,
+          channel: pr.channel,
         });
       });
+    } else {
+      // Remove the PR from tracking if it's approved
+      prTracker.delete(messageTs);
     }
   }
 
@@ -53,7 +57,7 @@ function getPendingReviews() {
 
 /**
  * Get all PRs that haven't been updated, grouped by author
- * @returns {Map<string, Array<{prUrl: string, messageTs: string}>>} Map of author ID to array of their stale PRs
+ * @returns {Map<string, Array<{prUrl: string, messageTs: string, channel: string}>>} Map of author ID to array of their stale PRs
  */
 async function getStaleAuthorPRs() {
   const authorPRs = new Map();
@@ -73,12 +77,54 @@ async function getStaleAuthorPRs() {
         authorPRs.get(authorId).push({
           prUrl: pr.prUrl,
           messageTs: messageTs,
+          channel: pr.channel,
         });
       }
     }
   }
 
   return authorPRs;
+}
+
+/**
+ * Creates a reminder message for stale PRs using Slack Block Kit
+ * @param {string} userId - Slack user ID
+ * @param {string} userName - User's real name
+ * @param {Array} prs - Array of PR objects
+ * @returns {Object} Formatted Slack message
+ */
+function createAuthorReminderMessage(userId, userName, prs) {
+  return {
+    channel: userId,
+    text: `Stale PR Reminder for ${userName}`,
+    blocks: [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `*Hi ${userName}!* 👋 Your PR${
+            prs.length > 1 ? "s haven't" : " hasn't"
+          } been updated in over 24 hours.`,
+        },
+      },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `*${prs.length} PR${
+            prs.length > 1 ? "s need" : " needs"
+          } attention:*\n${prs
+            .map(
+              (pr) =>
+                `• <https://${process.env.SLACK_WORKSPACE}.slack.com/archives/${
+                  pr.channel
+                }/p${pr.messageTs.replace(".", "")}|View PR>`
+            )
+            .join("\n")}`,
+        },
+      },
+    ],
+  };
 }
 
 /**
@@ -92,8 +138,8 @@ export async function sendReminders() {
     return;
   }
 
+  // Fetch pending reviews and the reviewers for each PR
   const reviewerPRs = getPendingReviews();
-  const staleAuthorPRs = getStaleAuthorPRs();
 
   // Send reminders to reviewers
   for (const [reviewerId, prs] of reviewerPRs.entries()) {
@@ -103,7 +149,14 @@ export async function sendReminders() {
       const userName = userInfo.user.real_name;
 
       // Create message with list of PRs
-      const prList = prs.map((pr) => pr.prUrl).join("\n");
+      const prList = prs
+        .map(
+          (pr) =>
+            `https://${process.env.SLACK_WORKSPACE}.slack.com/archives/${
+              pr.channel
+            }/p${pr.messageTs.replace(".", "")}`
+        )
+        .join("\n");
       const message = {
         channel: reviewerId, // Send DM to user
         text: `Hi, ${userName}! 👋 You have ${prs.length} pending PR${
@@ -120,30 +173,66 @@ export async function sendReminders() {
   }
 
   // Send reminders to PR authors with stale PRs
-  for (const [authorId, prs] of staleAuthorPRs.entries()) {
-    try {
-      // Get user info for personalized message
-      const userInfo = await slack.users.info({ user: authorId });
-      const userName = userInfo.user.real_name;
+  const staleAuthorPRs = await getStaleAuthorPRs();
 
-      // Create message with list of PRs
-      const prList = prs.map((pr) => pr.prUrl).join("\n");
-      const message = {
-        channel: authorId, // Send DM to user
-        text: `Hi, ${userName}! 👋 Your PR${
-          prs.length > 1 ? "s haven't" : " hasn't"
-        } been updated in over 24 hours. Please review the comments and update ${
-          prs.length > 1 ? "them" : "it"
-        } when you can:\n\n${prList}`,
-      };
+  // Return early if there are no stale PRs to process
+  if (!staleAuthorPRs || staleAuthorPRs.size === 0) return;
 
-      // Send the reminder
-      await slack.chat.postMessage(message);
-      log(`Sent reminder to author ${userName} about ${prs.length} stale PRs`);
-    } catch (error) {
-      log(`Error sending reminder to author ${authorId}:`, error);
-    }
+  // Process in batches with rate limiting
+  const BATCH_SIZE = 15; // Conservative limit for Slack's Tier 2
+  const authorEntries = Array.from(staleAuthorPRs.entries());
+  const batches = [];
+
+  while (authorEntries.length) {
+    batches.push(authorEntries.splice(0, BATCH_SIZE));
   }
+
+  const results = [];
+  for (const batch of batches) {
+    const batchResults = await Promise.allSettled(
+      batch.map(async ([authorId, prs]) => {
+        await new Promise((resolve) => setTimeout(resolve, 1000 / BATCH_SIZE));
+        try {
+          const userInfo = await slack.users.info({ user: authorId });
+          const userName = userInfo.user.real_name;
+          const message = createAuthorReminderMessage(authorId, userName, prs);
+
+          const result = await slack.chat.postMessage(message);
+          return {
+            status: "success",
+            userId: authorId,
+            prCount: prs.length,
+            messageTs: result.ts,
+          };
+        } catch (error) {
+          return {
+            status: "error",
+            userId: authorId,
+            error: error.message,
+            stack: error.stack,
+          };
+        }
+      })
+    );
+    results.push(...batchResults);
+  }
+
+  // Log batch results
+  const successful = results.filter(
+    (r) => r.status === "fulfilled" && r.value.status === "success"
+  );
+  const failed = results.filter(
+    (r) => r.status === "fulfilled" && r.value.status === "error"
+  );
+  const rejected = results.filter((r) => r.status === "rejected");
+
+  log({
+    event: "stale_pr_reminder_batch",
+    totalAuthors: staleAuthorPRs.size,
+    successful: successful.length,
+    failed: failed.length + rejected.length,
+    errors: [...failed.map((f) => f.value), ...rejected.map((r) => r.reason)],
+  });
 }
 
 /**

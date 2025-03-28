@@ -8,16 +8,22 @@ import log from "./logger.js";
 
 dotenv.config();
 
-// === Constants === //
+// ============================== Constants ============================== //
 
 const app = new App(appConfig);
 
-/** This is a comma-separated list of channel IDs */
+// This is a comma-separated list of channel IDs
 const TARGET_CHANNEL_IDS = process.env.SLACK_CHANNEL_ID.split(",").map((id) =>
   id.trim()
 );
 
-// === Functions === //
+// Emojis that indicate different actions
+const approvalEmojis = ["thumbsup", "+1"];
+const commentEmojis = ["memo"];
+const mergeEmojis = ["merge"];
+const stopEmojis = ["x"];
+
+// ============================== Functions ============================== //
 
 // Function to extract PR URL from message
 function extractPRUrl(text) {
@@ -84,10 +90,16 @@ async function removeReviewer(messageTs, reviewerId) {
     pr.reviewers = pr.reviewers.filter((id) => id !== reviewerId);
     if (pr.reviewers.length === 0) {
       pr.approved = true; // Mark as approved instead of deleting
-      return true; // PR fully reviewed
     }
+    return prTracker.set(messageTs, pr); // Update the Map with modified pr
   }
   return false;
+}
+
+// Function to check if all reviewers have approved the PR
+function allReviewersApproved(messageTs) {
+  const pr = prTracker.get(messageTs);
+  return pr && pr.approved;
 }
 
 // Function to stop tracking a PR completely
@@ -108,6 +120,112 @@ async function addReviewer(messageTs, reviewerId) {
   return false;
 }
 
+// Function to handle PR approval
+async function handlePrApproval(channel, messageTs, pr, reactingUser) {
+  // Check if this is an Asgard PR
+  // STB PRs are in draft status and cannot be merged
+  const isAsgard = pr.projectPath.includes("asgard");
+
+  // Remove the reacting user from reviewers. This function returns true if all reviewers have been removed.
+  await removeReviewer(messageTs, reactingUser).then((reviewerRemoved) => {
+    if (reviewerRemoved) {
+      log("Reviewer removed:", reactingUser);
+    } else {
+      log("Failed to remove reviewer:", reactingUser);
+      return;
+    }
+  });
+
+  // If all reviewers have approved
+  if (allReviewersApproved(messageTs)) {
+    const canMerge = await canMergePR(pr.projectPath, pr.mrIid);
+    const mergeFailureMessage = isAsgard
+      ? "The PR cannot be merged at this time. Please check for conflicts or other issues."
+      : "Please remove the PR from draft status and push the changes to the repo to trigger the smoke test.";
+
+    const mergeMessage = canMerge
+      ? "All reviewers have approved the PR! 🎉"
+      : `All reviewers have approved the PR! 🎉\n\n${mergeFailureMessage}`;
+
+    await app.client.chat.postMessage({
+      channel,
+      thread_ts: messageTs,
+      text: mergeMessage,
+    });
+  } else {
+    // Get user's name for the message
+    const userInfo = await app.client.users.info({ user: reactingUser });
+    const userName = userInfo.user.real_name || userInfo.user.name;
+
+    // Alert the author that a reviewer has approved the PR
+    await app.client.chat.postMessage({
+      channel,
+      thread_ts: messageTs,
+      text: `${userName} has approved the PR! 👍`,
+    });
+  }
+}
+
+// Function to handle comments on a PR
+async function handleCommentsOnPR(channel, messageTs, pr, reactingUser) {
+  // Get the reviewer's name who left the comment
+  const reviewerInfo = await app.client.users.info({
+    user: reactingUser,
+  });
+  const reviewerName = reviewerInfo.user.real_name || reviewerInfo.user.name;
+
+  // Get the original poster's info
+  const originalPoster = pr.authorId;
+
+  // Update the lastUpdated time when comments are added
+  pr.lastUpdated = new Date().toISOString();
+  prTracker.set(messageTs, pr);
+
+  await app.client.chat.postMessage({
+    channel,
+    thread_ts: messageTs,
+    text: `Hey <@${originalPoster}>, ${reviewerName} has left some comments on your PR! 📝`,
+  });
+}
+
+// Function to handle merging a PR
+async function handleMerge(channel, messageTs) {
+  if (stopTrackingPR(messageTs)) {
+    await app.client.chat.postMessage({
+      channel,
+      thread_ts: messageTs,
+      text: `The PR has been merged :merge: and will no longer be tracked.`,
+    });
+  } else {
+    log("There was an error removing this PR from being tracked.");
+    await app.client.chat.postMessage({
+      channel,
+      thread_ts: messageTs,
+      text: `There was an error removing this PR from being tracked.`,
+    });
+  }
+}
+
+// Function to stop tracking a PR
+async function handleStopTracking(channel, messageTs) {
+  if (stopTrackingPR(messageTs)) {
+    await app.client.chat.postMessage({
+      channel,
+      thread_ts: messageTs,
+      text: `This PR will no longer be tracked.`,
+    });
+  } else {
+    log("There was an error removing this PR from being tracked.");
+    await app.client.chat.postMessage({
+      channel,
+      thread_ts: messageTs,
+      text: `There was an error removing this PR from being tracked.`,
+    });
+  }
+}
+
+// ============================== Event Listeners ============================== //
+
 // Listen for messages that mention the bot
 app.event("app_mention", async ({ event, say }) => {
   const text = event.text.toLowerCase();
@@ -120,8 +238,8 @@ app.event("app_mention", async ({ event, say }) => {
 • Post a GitLab PR link in this channel to start tracking it
 • Add reviewers by mentioning them in the same message as the PR link
 • React with 👍 to approve a PR
+• React with :memo: to leave a comment on a PR
 • React with :x: to stop tracking a PR
-• React with :merge: to indicate the PR has been merged
 
 *Thread Commands*
 When in a PR thread, you can:
@@ -140,11 +258,10 @@ When in a PR thread, you can:
 
   // If this is a thread message, handle add/remove commands
   if (event.thread_ts) {
-    const command = text.includes("add-reviewer")
-      ? "add"
-      : text.includes("remove-reviewer")
-      ? "remove"
-      : null;
+    const command =
+      ["add-reviewer", "remove-reviewer"]
+        .find((cmd) => text.includes(cmd))
+        ?.split("-")[0] || null;
 
     if (command) {
       // Extract mentioned users (excluding the bot)
@@ -171,20 +288,21 @@ When in a PR thread, you can:
       const results = [];
       for (const userId of mentionedUsers) {
         if (command === "add") {
-          const added = await addReviewer(event.thread_ts, userId);
-          if (added) {
-            results.push(`<@${userId}> has been added as a reviewer.`);
-          } else {
-            results.push(`<@${userId}> is already a reviewer.`);
-          }
+          await addReviewer(event.thread_ts, userId).then((added) => {
+            results.push(
+              added
+                ? `<@${userId}> has been added as a reviewer.`
+                : `<@${userId}> is already a reviewer.`
+            );
+          });
         } else {
-          // remove reviewer
-          const removed = await removeReviewer(event.thread_ts, userId);
-          if (removed) {
-            results.push(`<@${userId}> has been removed as a reviewer.`);
-          } else {
-            results.push(`<@${userId}> was not a reviewer.`);
-          }
+          await removeReviewer(event.thread_ts, userId).then((removed) => {
+            results.push(
+              removed
+                ? `<@${userId}> has been removed as a reviewer.`
+                : `<@${userId}> was not a reviewer.`
+            );
+          });
         }
       }
 
@@ -207,7 +325,7 @@ When in a PR thread, you can:
     if (!prInfo) {
       log("No PR URL found in message");
       await say({
-        text: "I couldn't find a GitLab merge request URL in your message. Please make sure to include the full URL.",
+        text: `I couldn't find a GitLab merge request URL in your message. Please make sure to include the full URL (e.g., https://${process.env.GITLAB_HOST}/group/project/-/merge_requests/123)`,
         thread_ts: event.ts,
       });
       return;
@@ -240,7 +358,7 @@ When in a PR thread, you can:
     prTracker.set(event.ts, {
       prUrl: prInfo.url,
       reviewers: reviewerIds,
-      channel: event.channel,
+      channel: event.channel, // Add channel ID to tracking info
       approved: false,
       projectPath: prInfo.projectPath,
       mrIid: prInfo.mrIid,
@@ -280,134 +398,53 @@ When in a PR thread, you can:
 // Handle reaction added events
 app.event("reaction_added", async ({ event }) => {
   const {
-    item: { ts: messageTs, channel },
+    item: { ts: messageTs, channel, thread_ts },
     user: reactingUser,
     reaction,
   } = event;
+
+  // Ignore reactions on thread replies
+  if (thread_ts) return;
 
   // Check if this is a reaction to a tracked PR
   const pr = prTracker.get(messageTs);
   if (!pr) return;
 
-  // Set the type of project
-  // STB repos are in draft status and cannot be merged
-  const isAsgard = pr.projectPath.includes("asgard");
+  // Check if the reacting user is a reviewer
+  const reviewerFound = pr.reviewers.includes(reactingUser);
 
   try {
-    if (
-      (reaction === "thumbsup" || reaction === "+1") &&
-      pr.reviewers.includes(reactingUser)
-    ) {
-      // Remove the reacting user from reviewers
-      const allApproved = removeReviewer(messageTs, reactingUser);
-
-      // Get user's name for the message
-      const userInfo = await app.client.users.info({ user: reactingUser });
-      const userName = userInfo.user.name;
-
-      await app.client.chat.postMessage({
-        channel,
-        thread_ts: messageTs,
-        text: `${userName} has approved the PR! 👍`,
-      });
-
-      // If all reviewers have approved
-      if (allApproved) {
-        const canMerge = await canMergePR(pr.projectPath, pr.mrIid);
-        const mergeFailureMessage = isAsgard
-          ? "The PR cannot be merged at this time. Please check for conflicts or other issues."
-          : "Please remove the PR from draft status and push the changes to the repo to trigger the smoke test.";
-        const mergeMessage = canMerge
-          ? "Would you like me to merge it for you? React to the parent message with ✅ to merge."
-          : mergeFailureMessage;
-
-        await app.client.chat.postMessage({
-          channel,
-          thread_ts: messageTs,
-          text: `All reviewers have approved the PR! 🎉\n\n${mergeMessage}`,
-        });
-      }
-    } else if (reaction === "memo") {
-      // Get the reviewer's name who left the comment
-      const reviewerInfo = await app.client.users.info({ user: reactingUser });
-      const reviewerName =
-        reviewerInfo.user.real_name || reviewerInfo.user.name;
-
-      // Get the original poster's info
-      const originalPoster = pr.authorId;
-
-      // Update the lastUpdated time when comments are added
-      pr.lastUpdated = new Date().toISOString();
-      prTracker.set(messageTs, pr);
-
-      await app.client.chat.postMessage({
-        channel,
-        thread_ts: messageTs,
-        text: `Hey <@${originalPoster}>, ${reviewerName} has left some comments on your PR! 📝`,
-      });
-    } else if (reaction === "white_check_mark" && pr.approved && isAsgard) {
-      // Check if PR can be merged
-      const canMerge = await canMergePR(pr.projectPath, pr.mrIid);
-      if (!canMerge) {
-        await app.client.chat.postMessage({
-          channel,
-          thread_ts: messageTs,
-          text: "❌ The PR cannot be merged at this time. Please check for conflicts or other issues.",
-        });
-        return;
-      }
-
-      // Try to merge the PR
-      const merged = await mergePR(pr.projectPath, pr.mrIid);
-      if (merged) {
-        await app.client.chat.postMessage({
-          channel,
-          thread_ts: messageTs,
-          text: "🎉 Successfully merged the PR!",
-        });
-      } else {
-        await app.client.chat.postMessage({
-          channel,
-          thread_ts: messageTs,
-          text: "❌ Failed to merge the PR. Please try merging manually.",
-        });
-      }
-      // Stop tracking the PR in either case
-      stopTrackingPR(messageTs);
-    } else if (reaction === "merge") {
-      // Stop tracking the PR entirely
-      const wasTracked = stopTrackingPR(messageTs);
-      if (wasTracked) {
-        await app.client.chat.postMessage({
-          channel,
-          thread_ts: messageTs,
-          text: `The PR has been merged :merge: and will no longer be tracked.`,
-        });
-      }
-    } else if (reaction === "x") {
-      // Stop tracking the PR entirely
-      const wasTracked = stopTrackingPR(messageTs);
-      if (wasTracked) {
-        await app.client.chat.postMessage({
-          channel,
-          thread_ts: messageTs,
-          text: `This PR will no longer be tracked.`,
-        });
-      }
+    switch (true) {
+      case approvalEmojis.some((emoji) => reaction.includes(emoji)) &&
+        reviewerFound: // Allow approval if reviewer
+        await handlePrApproval(channel, messageTs, pr, reactingUser);
+        break;
+      case commentEmojis.some((emoji) => reaction.includes(emoji)) &&
+        reviewerFound: // Allow comments if reviewer
+        await handleCommentsOnPR(channel, messageTs, pr, reactingUser);
+        break;
+      case mergeEmojis.some((emoji) => reaction.includes(emoji)):
+        await handleMerge(channel, messageTs);
+        break;
+      case stopEmojis.some((emoji) => reaction.includes(emoji)):
+        await handleStopTracking(channel, messageTs);
+        break;
     }
   } catch (error) {
-    log("Error handling reaction:", error);
+    log("[slackListener.js] Error handling reaction:", error);
   }
 });
+
+// ============================== Exported Functions ============================== //
 
 // Export the setup function instead of running it directly
 export async function setupSlackListener() {
   try {
     await app.start();
-    log("⚡️ Slack Bolt app is running!");
+    log("[slackListener.js] ⚡️ Slack Bolt app is running!");
     return app;
   } catch (error) {
-    log("Error starting Slack Bolt app:", error);
+    log("[slackListener.js] Error starting Slack Bolt app:", error);
     throw error;
   }
 }

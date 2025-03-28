@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: primate:optimized
+    image: primate:latest
     container_name: primate-bot
     volumes:
       - ./logs:/usr/src/app/logs

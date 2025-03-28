@@ -1,6 +1,6 @@
 # PRimate Bot
 
-PRimate Bot is a Slack bot designed to help the teams track GitLab PRs. It monitors specified Slack channels for GitLab PR links, posts PR comments in Slack threads, notifies about pipeline failures, and sends daily summaries of open PRs.
+PRimate Bot is a Slack bot designed to help Wukong teams track GitLab PRs. It monitors specified Slack channels for GitLab PR links, posts PR comments in Slack threads, notifies about pipeline failures, and sends daily summaries of open PRs.
 
 ## Features
 
@@ -24,7 +24,6 @@ PRimate Bot is a Slack bot designed to help the teams track GitLab PRs. It monit
 - React with 👍 to approve a PR
 - React with :x: to stop tracking a PR
 - React with :merge: to indicate the PR has been merged
-- Once a PR is fully approved, the bot can merge it with a :white_check_mark:
 
 ### Thread Commands
 When in a PR thread, you can:
@@ -43,12 +42,16 @@ Update the `.env` file to change:
 - Daily summary time
 - API keys
 
-## Things to Test
-- Reminders
-- Different projects/repos
-- Removing/adding users
-- Install on the host machine
+## Deployment
 
-## Future Features
-- Send message for pipeline failures
-- Remind if PR not updated in a certain amount of time?
+The bot is deployed on a VSphere server.This is the same server that hosts the UXTeam Vault.
+
+The deployment is done using the `build_deploy.sh` script. This script builds the Docker image and compresses it into a TGZ. The TGZ is then sent to the UXTeam-Vault server using `scp`.
+
+Simply run `./build_deploy.sh` to deploy the bot.
+
+## Improvements
+- Slack messages for pipeline failures
+- Don't send notification if the user has left comments on the PR
+- Create dashboard for viewing data
+- Support for GitHub links
