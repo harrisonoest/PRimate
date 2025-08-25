@@ -1,7 +1,7 @@
 {
   "name": "primate",
   "version": "1.0.3",
-  "description": "Manages GitLab pull requests for the UXTeam.",
+  "description": "Manages GitLab pull requests.",
   "main": "bot.js",
   "dependencies": {
     "@slack/web-api": "^7.6.0",

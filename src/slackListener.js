@@ -5,6 +5,15 @@ import { appConfig, BOT_USER_ID } from "./config.js";
 import { canMergePR, mergePR } from "./bot.js";
 import { prTracker } from "./prReminders.js";
 import log from "./logger.js";
+import {
+  trackPRCreation,
+  trackPRApproval,
+  trackComment,
+  trackPRMerge,
+  getUserStats,
+  getLeaderboard,
+  getUserAverages,
+} from "./statistics.js";
 
 dotenv.config();
 
@@ -22,6 +31,7 @@ const approvalEmojis = ["thumbsup", "+1"];
 const commentEmojis = ["memo"];
 const mergeEmojis = ["merge"];
 const stopEmojis = ["x"];
+const fixedEmojis = ["fixed", "hammer_and_wrench", "wrench"];
 
 // ============================== Functions ============================== //
 
@@ -126,6 +136,27 @@ async function handlePrApproval(channel, messageTs, pr, reactingUser) {
   // STB PRs are in draft status and cannot be merged
   const isAsgard = pr.projectPath.includes("asgard");
 
+  const approvedAt = new Date().toISOString();
+
+  // Track the approval time for this reviewer
+  if (!pr.approvalTimes) {
+    pr.approvalTimes = {};
+  }
+  pr.approvalTimes[reactingUser] = approvedAt;
+
+  // Track first approval if this is the first one
+  if (!pr.firstApprovalAt) {
+    pr.firstApprovalAt = approvedAt;
+  }
+
+  // Track approval statistics
+  trackPRApproval(
+    reactingUser,
+    pr.authorId,
+    pr.createdAt || approvedAt,
+    approvedAt
+  );
+
   // Remove the reacting user from reviewers. This function returns true if all reviewers have been removed.
   await removeReviewer(messageTs, reactingUser).then((reviewerRemoved) => {
     if (reviewerRemoved) {
@@ -177,6 +208,17 @@ async function handleCommentsOnPR(channel, messageTs, pr, reactingUser) {
   // Get the original poster's info
   const originalPoster = pr.authorId;
 
+  // Track the user who left comments (if not already tracked)
+  if (!pr.commenters) {
+    pr.commenters = [];
+  }
+  if (!pr.commenters.includes(reactingUser)) {
+    pr.commenters.push(reactingUser);
+  }
+
+  // Track comment statistics
+  trackComment(reactingUser, pr.prUrl);
+
   // Update the lastUpdated time when comments are added
   pr.lastUpdated = new Date().toISOString();
   prTracker.set(messageTs, pr);
@@ -190,6 +232,15 @@ async function handleCommentsOnPR(channel, messageTs, pr, reactingUser) {
 
 // Function to handle merging a PR
 async function handleMerge(channel, messageTs) {
+  const pr = prTracker.get(messageTs);
+  const mergedAt = new Date().toISOString();
+
+  if (pr) {
+    // Mark PR as merged and track merge statistics
+    pr.merged = true;
+    trackPRMerge(pr.authorId, pr.createdAt || mergedAt, mergedAt);
+  }
+
   if (stopTrackingPR(messageTs)) {
     await app.client.chat.postMessage({
       channel,
@@ -224,6 +275,36 @@ async function handleStopTracking(channel, messageTs) {
   }
 }
 
+// Function to handle when PR author marks issues as fixed
+async function handlePRFixed(channel, messageTs, pr, reactingUser) {
+  // Only allow the PR author to use this reaction
+  if (reactingUser !== pr.authorId) {
+    return;
+  }
+
+  // Get all users who left comments on this PR
+  const commenters = pr.commenters || [];
+
+  if (commenters.length === 0) {
+    return; // No commenters to notify
+  }
+
+  // Get the PR author's name
+  const authorInfo = await app.client.users.info({ user: reactingUser });
+  const authorName = authorInfo.user.real_name || authorInfo.user.name;
+
+  // Create mentions for all commenters
+  const commenterMentions = commenters
+    .map((userId) => `<@${userId}>`)
+    .join(", ");
+
+  await app.client.chat.postMessage({
+    channel,
+    thread_ts: messageTs,
+    text: `🔧 ${authorName} has marked the issues as fixed! ${commenterMentions}, please review the updates.`,
+  });
+}
+
 // ============================== Event Listeners ============================== //
 
 // Listen for messages that mention the bot
@@ -239,12 +320,21 @@ app.event("app_mention", async ({ event, say }) => {
 • Add reviewers by mentioning them in the same message as the PR link
 • React with 👍 to approve a PR
 • React with :memo: to leave a comment on a PR
+• React with :fixed:, :hammer_and_wrench:, or :wrench: (PR author only) to notify commenters that issues have been addressed
 • React with :x: to stop tracking a PR
 
 *Thread Commands*
 When in a PR thread, you can:
 • \`@PRimate add-reviewer @user\` - Add a reviewer to the PR
 • \`@PRimate remove-reviewer @user\` - Remove a reviewer from the PR
+
+*Statistics Commands*
+• \`@PRimate stats me\` - View your personal PR statistics
+• \`@PRimate leaderboard\` - View top PR authors
+• \`@PRimate top approvers\` - View top PR approvers
+• \`@PRimate leaderboard comments\` - View most active reviewers
+• \`@PRimate top fastest\` - View fastest approval times
+• \`@PRimate leaderboard longest\` - View longest PR durations
 
 *Reminders*
 • Daily summaries of open PRs are sent automatically at 9AM.`;
@@ -254,6 +344,128 @@ When in a PR thread, you can:
       thread_ts: event.thread_ts || event.ts,
     });
     return;
+  }
+
+  // Handle statistics commands
+  if (text.includes("stats")) {
+    // Personal stats command
+    if (text.includes("me") || text.includes("my")) {
+      const userStats = getUserStats(event.user);
+      const averages = getUserAverages(event.user);
+
+      if (!userStats) {
+        await say({
+          text: "You don't have any tracked statistics yet! Start by creating or reviewing PRs.",
+          thread_ts: event.thread_ts || event.ts,
+        });
+        return;
+      }
+
+      const statsMessage = `📊 *Your Statistics:*
+      
+*Authoring:*
+• PRs Created: ${userStats.prsAuthored}
+• PRs Merged: ${userStats.prsMerged}
+• Longest PR Duration: ${
+        userStats.longestPRDuration
+          ? `${Math.round(userStats.longestPRDuration / 60)} hours`
+          : "N/A"
+      }
+• Average PR Duration: ${
+        averages && averages.avgPRDuration
+          ? `${Math.round(averages.avgPRDuration / 60)} hours`
+          : "N/A"
+      }
+
+*Reviewing:*
+• PRs Approved: ${userStats.prsApproved}  
+• Comments Left: ${userStats.commentsLeft}
+• Fastest Approval: ${
+        userStats.fastestApproval
+          ? `${userStats.fastestApproval} minutes`
+          : "N/A"
+      }
+• Average Approval Time: ${
+        averages && averages.avgApprovalTime
+          ? `${averages.avgApprovalTime} minutes`
+          : "N/A"
+      }
+
+_Stats since: ${new Date(userStats.firstActivity).toLocaleDateString()}_`;
+
+      await say({
+        text: statsMessage,
+        thread_ts: event.thread_ts || event.ts,
+      });
+      return;
+    }
+
+    // Leaderboard commands
+    if (text.includes("leaderboard") || text.includes("top")) {
+      let metric = "prsAuthored"; // default
+      let title = "PR Authors";
+
+      if (text.includes("approvers") || text.includes("approved")) {
+        metric = "prsApproved";
+        title = "PR Approvers";
+      } else if (text.includes("comments") || text.includes("reviewers")) {
+        metric = "commentsLeft";
+        title = "Active Reviewers";
+      } else if (text.includes("mergers") || text.includes("merged")) {
+        metric = "prsMerged";
+        title = "PR Mergers";
+      } else if (text.includes("fastest")) {
+        metric = "fastestApproval";
+        title = "Fastest Approvers";
+      } else if (text.includes("longest")) {
+        metric = "longestPRDuration";
+        title = "Longest PR Durations";
+      }
+
+      const leaderboard = getLeaderboard(metric, 10);
+
+      if (leaderboard.length === 0) {
+        await say({
+          text: `No data available for ${title.toLowerCase()} yet.`,
+          thread_ts: event.thread_ts || event.ts,
+        });
+        return;
+      }
+
+      // Get user info for display names
+      const leaderboardWithNames = await Promise.all(
+        leaderboard.map(async (entry, index) => {
+          try {
+            const userInfo = await app.client.users.info({
+              user: entry.userId,
+            });
+            const name = userInfo.user.real_name || userInfo.user.name;
+            let valueDisplay = entry.value;
+
+            // Format time-based metrics
+            if (metric === "fastestApproval") {
+              valueDisplay = `${entry.value} minutes`;
+            } else if (metric === "longestPRDuration") {
+              valueDisplay = `${Math.round(entry.value / 60)} hours`;
+            }
+
+            return `${index + 1}. ${name}: ${valueDisplay}`;
+          } catch (error) {
+            return `${index + 1}. ${entry.userId}: ${entry.value}`;
+          }
+        })
+      );
+
+      const leaderboardMessage = `🏆 *Top ${title}:*\n\n${leaderboardWithNames.join(
+        "\n"
+      )}`;
+
+      await say({
+        text: leaderboardMessage,
+        thread_ts: event.thread_ts || event.ts,
+      });
+      return;
+    }
   }
 
   // If this is a thread message, handle add/remove commands
@@ -325,7 +537,7 @@ When in a PR thread, you can:
     if (!prInfo) {
       log("No PR URL found in message");
       await say({
-        text: `I couldn't find a GitLab merge request URL in your message. Please make sure to include the full URL (e.g., https://${process.env.GITLAB_HOST}/group/project/-/merge_requests/123)`,
+        text: "I couldn't find a GitLab merge request URL in your message. Please make sure to include the full URL (e.g., https://gitlab.windows.nagrastar.com/group/project/-/merge_requests/123)",
         thread_ts: event.ts,
       });
       return;
@@ -354,17 +566,27 @@ When in a PR thread, you can:
       return;
     }
 
+    const createdAt = new Date().toISOString();
+
     // Store PR tracking information
     prTracker.set(event.ts, {
       prUrl: prInfo.url,
       reviewers: reviewerIds,
       channel: event.channel, // Add channel ID to tracking info
       approved: false,
+      merged: false,
       projectPath: prInfo.projectPath,
       mrIid: prInfo.mrIid,
       authorId: event.user,
-      lastUpdated: new Date().toISOString(), // Track initial creation time
+      createdAt: createdAt, // Track PR creation time
+      lastUpdated: createdAt,
+      commenters: [], // Track users who left comments
+      approvalTimes: {}, // Track individual approval times
+      firstApprovalAt: null, // Track first approval
     });
+
+    // Track PR creation statistics
+    trackPRCreation(event.user, prInfo.url, createdAt);
 
     // Get usernames for display
     const reviewers = await Promise.all(
@@ -426,8 +648,13 @@ app.event("reaction_added", async ({ event }) => {
       case mergeEmojis.some((emoji) => reaction.includes(emoji)):
         await handleMerge(channel, messageTs);
         break;
-      case stopEmojis.some((emoji) => reaction.includes(emoji)):
+      // Note: This is different because the stop emoji is simply "x" so we can't
+      //       use a substring.
+      case stopEmojis.some((emoji) => reaction == emoji):
         await handleStopTracking(channel, messageTs);
+        break;
+      case fixedEmojis.some((emoji) => reaction.includes(emoji)):
+        await handlePRFixed(channel, messageTs, pr, reactingUser);
         break;
     }
   } catch (error) {

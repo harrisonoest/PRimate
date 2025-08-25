@@ -22,6 +22,8 @@ PRimate Bot is a Slack bot designed to help Wukong teams track GitLab PRs. It mo
 - Post a GitLab PR link in a monitored channel to start tracking it
 - Add reviewers by mentioning them in the same message as the PR link
 - React with 👍 to approve a PR
+- React with :memo: to indicate you've left comments on the PR
+- React with :fixed:, :hammer_and_wrench:, or :wrench: (PR author only) to notify commenters that issues have been addressed
 - React with :x: to stop tracking a PR
 - React with :merge: to indicate the PR has been merged
 
@@ -29,6 +31,15 @@ PRimate Bot is a Slack bot designed to help Wukong teams track GitLab PRs. It mo
 When in a PR thread, you can:
 - `@PRimate add-reviewer @user` - Add a reviewer to the PR
 - `@PRimate remove-reviewer @user` - Remove a reviewer from the PR
+
+### Statistics Commands
+The bot tracks comprehensive PR statistics and provides leaderboards:
+- `@PRimate stats me` - View your personal PR statistics
+- `@PRimate leaderboard` - View top PR authors
+- `@PRimate top approvers` - View top PR approvers
+- `@PRimate leaderboard comments` - View most active reviewers
+- `@PRimate top fastest` - View fastest approval times
+- `@PRimate leaderboard longest` - View longest PR durations
 
 ### Daily Summaries
 The bot sends daily summaries of open PRs at the configured time. These summaries include:
@@ -44,6 +55,5 @@ Update the `.env` file to change:
 
 ## Improvements
 - Slack messages for pipeline failures
-- Don't send notification if the user has left comments on the PR
 - Create dashboard for viewing data
 - Support for GitHub links
